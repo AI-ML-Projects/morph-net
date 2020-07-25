@@ -46,11 +46,14 @@ from __future__ import print_function
 
 import collections
 import copy
+import enum
+import functools
 import json
-from enum import Enum
 
+from morph_net.tools import structure_exporter as se
 import tensorflow.compat.v1 as tf
 from tensorflow.compat.v1 import layers as tf_layers
+from tensorflow.compat.v1.keras import layers as keras_layers
 from tensorflow.contrib import framework
 from tensorflow.contrib import layers as contrib_layers
 from tensorflow.contrib import slim as slim_layers
@@ -125,11 +128,361 @@ def is_vanished(maybe_tensor):
           maybe_tensor == VANISHED) or maybe_tensor is None
 
 
-class FallbackRule(Enum):
+class FallbackRule(enum.Enum):
   """Fallback rules for the ConfigurableOps class."""
   pass_through = 'pass_through'
   strict = 'strict'
   zero = 'zero'
+
+
+def _get_op_name(configurable_keras_layer_instance):
+  """Get full op name including scopes."""
+  parameterization = configurable_keras_layer_instance.parameterization
+  layer_name = configurable_keras_layer_instance.name
+  op_suffix = configurable_keras_layer_instance.op_suffix
+  is_strict = configurable_keras_layer_instance.is_strict
+
+  if layer_name.endswith('/'):
+    raise ValueError(
+        'Layer name `{}` ends with `/` which leads to unexpected '
+        'behavior when parsing scope.'.format(layer_name))
+
+  full_scope = framework.get_name_scope()  # takes care of duplicate scopes
+  op_name = full_scope + '/' + op_suffix
+
+  if (is_strict and op_name not in parameterization):
+    # If strict and op_name not found in parameterization, throw an error.
+    raise KeyError('op_name \"%s\" not found in parameterization' % op_name)
+  return op_name
+
+
+def _insert_to_parameterization_log(
+    configurable_keras_layer_instance, op_name, num_outputs):
+  """Logs the NUM_OUTPUTS into constructed_ops dict."""
+  constructed_ops = configurable_keras_layer_instance.constructed_ops
+  if op_name in constructed_ops:
+    tf.logging.warning('Function called more than once with scope %s.', op_name)
+  constructed_ops[op_name] = num_outputs
+
+
+def _configurable_keras_layer_build(configurable_keras_layer_instance):
+  """Encapsulates the `build` logic of all Configurable Keras layers."""
+  parameterization = configurable_keras_layer_instance.parameterization
+  num_outputs_attr = configurable_keras_layer_instance.num_outputs_attr
+
+  op_name = _get_op_name(configurable_keras_layer_instance)
+  original_num_outputs = getattr(
+      configurable_keras_layer_instance, num_outputs_attr)
+  num_outputs = parameterization.get(op_name, original_num_outputs)
+  _insert_to_parameterization_log(
+      configurable_keras_layer_instance, op_name, num_outputs)
+  configurable_keras_layer_instance.is_null_op = num_outputs == 0
+  setattr(configurable_keras_layer_instance, num_outputs_attr, num_outputs)
+
+
+class ConfigurableConv2D(keras_layers.Conv2D):
+  """Keras Conv2D Layer that sets NUM_OUTPUTS according to parameterization."""
+
+  def __init__(self,
+               parameterization,
+               constructed_ops,
+               is_strict,
+               *args,
+               **kwargs):
+    """Initialize configurable Keras Conv2D.
+
+    Args:
+      parameterization: Dict: MorphNet-generated parameterization dict mapping
+        op names to number of filters/neurons.
+        whereas the op_suffix for Dense, is 'MatMul'.
+      constructed_ops: A dict to keep track of parameterized ops. NOTE: This
+        dict will be modified during `build`.
+      is_strict: If True, all constructed ops must exist in the
+        parameterization.
+      *args: Args for Keras Layer's __init__.
+      **kwargs: Kwargs for Keras Layer's __init__.
+    """
+    super(ConfigurableConv2D, self).__init__(*args, **kwargs)
+    self.parameterization = parameterization
+    self.constructed_ops = constructed_ops
+    self.is_strict = is_strict
+    self.is_null_op = False
+    self.op_suffix = 'Conv2D'
+    self.num_outputs_attr = 'filters'
+
+  def __call__(self, inputs, *args, **kwargs):
+    if is_vanished(inputs):
+      return VANISHED
+    outputs = super(ConfigurableConv2D, self).__call__(inputs, *args, **kwargs)
+
+    # Note: If num_outputs=0, we want to return VANISHED. However, we can't
+    # return VANISHED in `call` since Keras requires the outputs of `call` be
+    # Tensors. Instead, we let Keras build a no-op convolution (with output
+    # channels = 0) and ignore its output.
+    return VANISHED if self.is_null_op else outputs
+
+  def build(self, input_shape):
+    _configurable_keras_layer_build(self)
+    return super(ConfigurableConv2D, self).build(input_shape)
+
+
+class ConfigurableSeparableConv2D(keras_layers.SeparableConv2D):
+  """Keras SeparableConv2D that sets NUM_OUTPUTS from parameterization."""
+
+  def __init__(self,
+               parameterization,
+               constructed_ops,
+               is_strict,
+               *args,
+               **kwargs):
+    """Initialize configurable Keras SeparableConv2D.
+
+    Args:
+      parameterization: Dict: MorphNet-generated parameterization dict mapping
+        op names to number of filters/neurons.
+        whereas the op_suffix for Dense, is 'MatMul'.
+      constructed_ops: A dict to keep track of parameterized ops. NOTE: This
+        dict will be modified during `build`.
+      is_strict: If True, all constructed ops must exist in the
+        parameterization.
+      *args: Args for Keras Layer's __init__.
+      **kwargs: Kwargs for Keras Layer's __init__.
+    """
+    super(ConfigurableSeparableConv2D, self).__init__(*args, **kwargs)
+    self.parameterization = parameterization
+    self.constructed_ops = constructed_ops
+    self.is_strict = is_strict
+    self.is_null_op = False
+    self.op_suffix = 'separable_conv2d'
+    self.num_outputs_attr = 'filters'
+
+  def __call__(self, inputs, *args, **kwargs):
+    if is_vanished(inputs):
+      return VANISHED
+    outputs = super(ConfigurableSeparableConv2D, self).__call__(
+        inputs, *args, **kwargs)
+
+    # Note: If num_outputs=0, we want to return VANISHED. However, we can't
+    # return VANISHED in `call` since Keras requires the outputs of `call` be
+    # Tensors. Instead, we let Keras build a no-op convolution (with output
+    # channels = 0) and ignore its output.
+    return VANISHED if self.is_null_op else outputs
+
+  def build(self, input_shape):
+    _configurable_keras_layer_build(self)
+    return super(ConfigurableSeparableConv2D, self).build(input_shape)
+
+
+class ConfigurableDense(keras_layers.Dense):
+  """Keras Dense Layer that sets NUM_OUTPUTS according to parameterization."""
+
+  def __init__(self,
+               parameterization,
+               constructed_ops,
+               is_strict,
+               *args,
+               **kwargs):
+    """Initialize configurable Keras Dense.
+
+    Args:
+      parameterization: Dict: MorphNet-generated parameterization dict mapping
+        op names to number of filters/neurons.
+        whereas the op_suffix for Dense, is 'MatMul'.
+      constructed_ops: A dict to keep track of parameterized ops. NOTE: This
+        dict will be modified during `build`.
+      is_strict: If True, all constructed ops must exist in the
+        parameterization.
+      *args: Args for Keras Layer's __init__.
+      **kwargs: Kwargs for Keras Layer's __init__.
+    """
+    super(ConfigurableDense, self).__init__(*args, **kwargs)
+    self.parameterization = parameterization
+    self.constructed_ops = constructed_ops
+    self.is_strict = is_strict
+    self.is_null_op = False
+    self.op_suffix = 'MatMul'
+    self.num_outputs_attr = 'units'
+
+  def __call__(self, inputs, *args, **kwargs):
+    if is_vanished(inputs):
+      return VANISHED
+    outputs = super(ConfigurableDense, self).__call__(inputs, *args, **kwargs)
+
+    # Note: If num_outputs=0, we want to return VANISHED. However, we can't
+    # return VANISHED in `call` since Keras requires the outputs of `call` be
+    # Tensors. Instead, we let Keras build a no-op convolution (with output
+    # channels = 0) and ignore its output.
+    return VANISHED if self.is_null_op else outputs
+
+  def build(self, input_shape):
+    _configurable_keras_layer_build(self)
+    return super(ConfigurableDense, self).build(input_shape)
+
+
+class PassThroughKerasLayerWrapper(object):
+  """Wraps Keras Layer to handle VANISHED inputs.
+
+  Wraps `keras_layer_class` (Keras Layer) to return VANISHED output on VANISHED
+  input. This is useful when MorphNet removes convolutions from the network (by
+  setting num_filters=0) in which case downstream ops should not be constructed.
+  """
+
+  def __init__(self,
+               keras_layer_class,
+               *args_for_keras_layer,
+               **kwargs_for_keras_layer):
+    """Initialize configurable Keras Layer wrapper.
+
+    Args:
+      keras_layer_class: Keras Layer class to wrap.
+      *args_for_keras_layer: Args to initialize keras_layer_class (see
+        `__call__`).
+      **kwargs_for_keras_layer: Kwargs to initialize keras_layer_class (see
+        `__call__`).
+    """
+    self.keras_layer_class = keras_layer_class
+    self.args_for_keras_layer = args_for_keras_layer
+    self.kwargs_for_keras_layer = kwargs_for_keras_layer
+
+  def __call__(self, inputs, *args, **kwargs):
+    # Handle list of tensors (Merge layers).
+    if isinstance(inputs, (list, tuple)):
+      inputs = [t for t in inputs if not is_vanished(t)]
+
+      # If `inputs` is a list, we assume it is correct behavior to return
+      # `inputs[0]` if len(inputs) == 1 (as is true with Add, Multiply,
+      # Concatenate). We preempt __call__ since Merge layers require
+      # len(inputs) > 1.
+      if not inputs:
+        return VANISHED
+      elif len(inputs) == 1:
+        return inputs[0]
+
+    # Handle single tensor inputs.
+    elif is_vanished(inputs):
+      return VANISHED
+
+    self.keras_layer_instance = self.keras_layer_class(
+        *self.args_for_keras_layer,
+        **self.kwargs_for_keras_layer)
+    return self.keras_layer_instance(inputs, *args, **kwargs)
+
+
+def hijack_keras_module(
+    parameterization_or_file,
+    module,
+    fallback_rule=FallbackRule.pass_through,
+    remove_common_prefix=True,
+    keep_first_channel_alive=True):
+  """Replaces Keras module with a fake "module" containing configurable Layers.
+
+  If a module imports Keras layers:
+  ```
+  from tensorflow.compat.v1.keras.layers import Conv2D
+  from tensorflow.compat.v1.keras.layers import SeparableConv2D
+  # ...
+  ```
+
+  or defines global aliases:
+  ```
+  import tensorflow.compat.v1.keras.layers as keras_layers
+  Conv2D = keras_layers.Conv2D
+  ```
+
+  then this function can be used to easily replace these classes with a
+  configurable variant where the number of filters/neurons in each layer are
+  set by a parameterization dict (or file) produced by MorphNet.
+
+  After calling `hijack_keras_module(parameterization, module)`, any call to
+  `module.Conv2D` or `module.Dense` will be replaced with a call to a unique
+  Keras Layer which wraps the original base_class (see
+  `_configurable_keras_layer_factory` for more details).
+
+  Args:
+    parameterization_or_file: Either:
+      * A dict mapping op names to integer NUM_OUTPUTs
+      * A path to a JSON file containing the above dict.
+    module: A module name to override its Keras.
+    fallback_rule: A `FallbackRule` enum which controls fallback behavior
+      (see ConfigurableOps.__init__ for more details.)
+    remove_common_prefix: If True, ignores outer level scope in all op names
+      in the parameterization.
+    keep_first_channel_alive: If True, keeps at least 1 neuron in each layer.
+
+  Returns:
+    A dict of the function pointers before the hijacking.
+
+  Raises:
+    ValueError if trying to hijack the Keras layers module
+    (`tensorflow.compat.v1.keras`) itself.
+  """
+  # TODO(shraman): check if this still happens with functools.partial solution
+  if module == keras_layers:
+    raise ValueError(
+        'Cannot hijack {} (will cause infinite loop).'.format(
+            keras_layers.__name__))
+
+  parameterization_or_file = parameterization_or_file or {}
+  if not isinstance(parameterization_or_file, (str, dict)):
+    raise ValueError(
+        'Expected dict or string (filename) for `parameterization_or_file`. '
+        'Instead got: {}'.format(type(parameterization_or_file)))
+  if isinstance(parameterization_or_file, str):
+    with tf.gfile.Open(parameterization_or_file, 'r') as f:
+      parameterization = json.loads(f.read())
+  else:
+    parameterization = parameterization_or_file
+
+  if remove_common_prefix:
+    rename_op = se.get_remove_common_prefix_fn(parameterization)
+    parameterization = {rename_op(k): v for k, v in parameterization.items()}
+
+  if keep_first_channel_alive:
+    parameterization = {k: max(v, 1) for k, v in parameterization.items()}
+
+  fallback_rule = _get_fallback_rule_as_enum(fallback_rule)
+  is_strict = fallback_rule == FallbackRule.strict
+  original_layer_classes = {}
+  constructed_ops = collections.OrderedDict()
+
+  def _maybe_replace_layer_class(class_name, configurable_layer_class):
+    if hasattr(module, class_name):
+      original_layer_classes[class_name] = getattr(module, class_name)
+      setattr(module, class_name, configurable_layer_class)
+
+  for configurable_layer_class, class_name in [
+      (ConfigurableConv2D, 'Conv2D'),
+      (ConfigurableSeparableConv2D, 'SeparableConv2D'),
+      (ConfigurableDense, 'Dense')]:
+    configurable_layer_class = functools.partial(
+        configurable_layer_class,
+        parameterization,
+        constructed_ops,
+        is_strict)
+    _maybe_replace_layer_class(class_name, configurable_layer_class)
+
+  for keras_layer_class, class_name in [
+      (keras_layers.BatchNormalization, 'BatchNormalization'),
+      (keras_layers.Activation, 'Activation'),
+      (keras_layers.UpSampling2D, 'UpSampling2D'),
+      (keras_layers.Add, 'Add'),
+      (keras_layers.Concatenate, 'Concatenate'),
+      (keras_layers.Multiply, 'Multiply')]:
+    pass_through_layer_class = functools.partial(
+        PassThroughKerasLayerWrapper,
+        keras_layer_class)
+    _maybe_replace_layer_class(class_name, pass_through_layer_class)
+
+  return constructed_ops, parameterization, original_layer_classes
+
+
+def _get_fallback_rule_as_enum(fallback_rule):
+  if not (isinstance(fallback_rule, FallbackRule) or
+          isinstance(fallback_rule, str)):
+    raise ValueError('fallback_rule must be a string or FallbackRule Enum')
+  if isinstance(fallback_rule, str):
+    return FallbackRule[fallback_rule]  # Converts from string.
+  return fallback_rule
 
 
 class ConfigurableOps(object):
@@ -179,17 +532,14 @@ class ConfigurableOps(object):
       ValueError: If fallback_rule is not a string or a FallbackRule enum.
     """
 
-    self._parameterization = parameterization or {}
-
     if not (isinstance(fallback_rule, FallbackRule) or
             isinstance(fallback_rule, str)):
       raise ValueError('fallback_rule must be a string or FallbackRule Enum')
 
     self._function_dict = function_dict or DEFAULT_FUNCTION_DICT
     self._suffix_dict = _SUFFIX_DICT
+    self._parameterization = parameterization or {}
     self._constructed_ops = collections.OrderedDict()
-    if isinstance(fallback_rule, str):
-      fallback_rule = FallbackRule[fallback_rule]  # Converts from string.
     self._default_to_zero = fallback_rule == FallbackRule.zero
     self._strict = fallback_rule == FallbackRule.strict
     self.default_scope_to_counts_map = {}
@@ -337,7 +687,7 @@ class ConfigurableOps(object):
       if function not in _OP_SCOPE_DEFAULTS:
         raise ValueError(
             'No `scope` or `name` found in kwargs, and no default scope '
-            'defined for {}'.format(_get_function_name(function)))
+            'defined for {}'.format(_get_function_or_class_name(function)))
       op_scope = _OP_SCOPE_DEFAULTS[function]
       full_scope = current_scope + op_scope
       if full_scope in self._scope_counts:
@@ -495,9 +845,10 @@ def _get_from_args_or_kwargs(name, index, args, kwargs, is_required=True):
     return None
 
 
-def _get_function_name(function):
-  """Get a descriptive identifier for `function`."""
-  return '{}.{}'.format(function.__module__, function.__name__)
+def _get_function_or_class_name(function_or_class):
+  """Get a descriptive identifier for a function or class."""
+  return '{}.{}'.format(function_or_class.__module__,
+                        function_or_class.__name__)
 
 
 def hijack_module_functions(configurable_ops, module):
@@ -541,24 +892,34 @@ def hijack_module_functions(configurable_ops, module):
   Returns:
     A dict of the function pointers before the hijacking.
   """
+  return _replace_attrs(configurable_ops, module, DEFAULT_FUNCTION_DICT)
+
+
+def _replace_attrs(source, target, attr_names):
+  """Copies attributes from `source` to `target`.
+
+  Args:
+    source: Any python object.
+    target: Any python object.
+    attr_names: List of string names specifying attributes to copy from
+      `source` to `target`.
+
+  Returns:
+    A dict of `target` attributes before copying.
+  """
   originals = {}
-
   def maybe_setattr(attr):
-    """Sets module.attr = configurable_ops.attr if module has attr.
-
-    Overrides module.'attr' with configurable_ops.'attr', if module already has
-    an attribute name 'attr'.
+    """Sets target.attr = source.attr if target has attr.
 
     Args:
-
       attr: Name of the attribute to override.
     """
-    if hasattr(module, attr):
-      originals[attr] = getattr(module, attr)
-      setattr(module, attr, getattr(configurable_ops, attr))
+    if hasattr(target, attr):
+      originals[attr] = getattr(target, attr)
+      setattr(target, attr, getattr(source, attr))
 
-  for fn in DEFAULT_FUNCTION_DICT:
-    maybe_setattr(fn)
+  for attr in attr_names:
+    maybe_setattr(attr)
   return originals
 
 
